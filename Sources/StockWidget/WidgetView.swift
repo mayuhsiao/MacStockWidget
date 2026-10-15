@@ -34,7 +34,8 @@ enum Fmt {
     }
 
     static func percent(_ v: Double) -> String {
-        (v > 0 ? "+" : v < 0 ? "-" : "") + String(format: "%.2f%%", abs(v))
+        let v = abs(v) < 0.005 ? 0 : v   // 避免顯示 -0.00%
+        return (v > 0 ? "+" : v < 0 ? "-" : "") + String(format: "%.2f%%", abs(v))
     }
 
     static let time: DateFormatter = {
@@ -81,8 +82,7 @@ struct WidgetView: View {
                 ForEach(Market.allCases) { market in
                     let list = store.items(in: market)
                     if !list.isEmpty {
-                        SectionHeader(market: market, session: market == .tw ? store.twSession : store.usSession,
-                                      time: sectionTime(market))
+                        SectionHeader(market: market, session: store.session(of: market), time: sectionTime(market))
                         ForEach(list) { item in
                             StockRow(item: item, quote: store.quotes[item.id], palette: palette,
                                      showSparkline: store.showSparkline)
@@ -159,7 +159,7 @@ struct WidgetView: View {
     private func sectionTime(_ market: Market) -> String? {
         let times = store.items(in: market).compactMap { store.quotes[$0.id]?.extended?.time ?? store.quotes[$0.id]?.time }
         guard let latest = times.max() else { return nil }
-        return market == .tw ? Fmt.twTime.string(from: latest) : "美東 " + Fmt.nyTime.string(from: latest)
+        return market == .us ? "美東 " + Fmt.nyTime.string(from: latest) : Fmt.twTime.string(from: latest)
     }
 }
 
@@ -215,10 +215,11 @@ private struct SessionBadge: View {
 
     private var info: (String, Color) {
         switch session {
-        case .regular: return ("盤中", .blue)
+        case .regular: return (market == .futures ? "交易中" : "盤中", .blue)
         case .pre: return (market == .tw ? "試撮" : "盤前", .orange)
         case .post: return ("盤後", .purple)
-        case .closed: return ("收盤", .gray)
+        case .night: return ("夜盤", .indigo)
+        case .closed: return (market == .futures ? "休市" : "收盤", .gray)
         }
     }
 
@@ -250,6 +251,8 @@ struct StockRow: View {
         case .us:
             if item.symbol.hasPrefix("^") || item.symbol.contains("=") { return (item.name, item.symbol) }
             return (item.symbol, item.name)
+        case .futures:
+            return (item.name, quote?.contract ?? item.displaySymbol)
         }
     }
 
@@ -346,16 +349,25 @@ private struct ExtendedLine: View {
     var ext: ExtendedQuote
     var palette: Palette
 
+    private var icon: (String, Color) {
+        switch ext.kind {
+        case .pre: return ("sunrise.fill", .orange)
+        case .post: return ("moon.fill", .purple)
+        case .night: return ("moon.stars.fill", .indigo)
+        }
+    }
+
     var body: some View {
         HStack(spacing: 5) {
-            Image(systemName: ext.isPre ? "sunrise.fill" : "moon.fill")
+            Image(systemName: icon.0)
                 .font(.system(size: 9))
-                .foregroundStyle(ext.isPre ? .orange : .purple)
+                .foregroundStyle(icon.1)
             Text(ext.label)
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
             if let t = ext.time {
-                Text(Fmt.nyTime.string(from: t))
+                // 美股盤前盤後顯示美東時間，台指期夜盤顯示台灣時間
+                Text((ext.kind == .night ? Fmt.twTime : Fmt.nyTime).string(from: t))
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundStyle(.tertiary)
             }

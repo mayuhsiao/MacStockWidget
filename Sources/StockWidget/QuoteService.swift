@@ -27,13 +27,17 @@ enum QuoteService {
     }()
 
     private static func get(_ url: URL) async throws -> Data {
-        var req = URLRequest(url: url)
+        try await send(URLRequest(url: url))
+    }
+
+    private static func send(_ request: URLRequest) async throws -> Data {
+        var req = request
         // Yahoo 對「完整瀏覽器 UA 但沒有 cookie」的請求會回 429，簡短 UA 反而正常
         req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
         let (data, resp) = try await session.data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw QuoteError.badResponse }
         guard (200..<300).contains(http.statusCode) else {
-            if http.statusCode == 404 { throw QuoteError.notFound(url.lastPathComponent) }
+            if http.statusCode == 404 { throw QuoteError.notFound(req.url?.lastPathComponent ?? "") }
             throw QuoteError.http(http.statusCode)
         }
         return data
@@ -84,7 +88,7 @@ enum QuoteService {
             let extPrice = m.fulldayPrice ?? last.v
             let isPre = regWin.map { last.t < $0.start } ?? false
             let change = extPrice - price
-            extended = ExtendedQuote(isPre: isPre, price: extPrice, change: change,
+            extended = ExtendedQuote(kind: isPre ? .pre : .post, price: extPrice, change: change,
                                      changePercent: price == 0 ? 0 : change / price * 100,
                                      time: Date(timeIntervalSince1970: last.t))
         }
@@ -173,6 +177,76 @@ enum QuoteService {
         return .regular
     }
 
+    // MARK: - 台指期（Yahoo 奇摩股市）
+
+    /// 台指期近月報價，一次抓全部商品。Yahoo 把「夜盤 15:00 + 隔日日盤到 13:45」當作同一個交易日，
+    /// 參考價都是最近一次的結算價，跟期交所的漲跌算法一致。
+    static func twFutures(_ products: [String], now: Date = Date()) async throws -> [String: Quote] {
+        let symbols = products.compactMap { TaifexProduct.yahooSymbols[$0] }
+        guard !symbols.isEmpty else { return [:] }
+        let list = "[" + symbols.map { "\"\($0)\"" }.joined(separator: ",") + "]"
+        let encoded = list.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? list
+        guard let url = URL(string: "https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService.ApacLibraCharts;autoRefresh=1;symbols=\(encoded);type=tick") else {
+            throw QuoteError.badResponse
+        }
+        let items = try JSONDecoder().decode([YahooTWChart].self, from: try await get(url))
+        let session = taifexSession(now: now)
+
+        var out: [String: Quote] = [:]
+        for item in items {
+            guard let product = TaifexProduct.yahooSymbols.first(where: { $0.value == item.symbol })?.key,
+                  let m = item.chart?.meta, let price = m.regularMarketPrice,
+                  let prev = m.previousClose ?? m.chartPreviousClose else { continue }
+            let ts = item.chart?.timestamp ?? []
+            let closes = item.chart?.indicators?.quote?.first?.close ?? []
+            var spark: [SparkPoint] = []
+            if let reg = m.currentTradingPeriod?.regular, reg.end > reg.start {
+                spark = zip(ts, closes).compactMap { t, c in
+                    c.map { SparkPoint(x: (t - reg.start) / (reg.end - reg.start), y: $0) }
+                }
+            }
+            // 沒有夜盤的商品（金融期）交易日從隔天 08:45 才開始
+            var itemSession = session
+            if let reg = m.currentTradingPeriod?.regular, now.timeIntervalSince1970 < reg.start { itemSession = .closed }
+            let sessionName: String
+            switch itemSession {
+            case .regular: sessionName = "日盤"
+            case .night: sessionName = "夜盤"
+            default: sessionName = "近月"
+            }
+            out[product] = Quote(
+                price: price,
+                previousClose: prev,
+                name: m.name,
+                contract: "\(product) · \(sessionName)",
+                limitUp: m.limitUpPrice,
+                limitDown: m.limitDownPrice,
+                time: m.regularMarketTime.map { Date(timeIntervalSince1970: $0) },
+                session: itemSession,
+                spark: spark,
+                sparkBaseline: prev
+            )
+        }
+        return out
+    }
+
+    private static func taipeiClock(_ now: Date) -> (weekday: Int, minutes: Int) {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "Asia/Taipei")!
+        let c = cal.dateComponents([.weekday, .hour, .minute], from: now)
+        return (c.weekday ?? 1, (c.hour ?? 0) * 60 + (c.minute ?? 0))
+    }
+
+    /// 日盤 08:45–13:45；夜盤 15:00–隔日 05:00（週一到週五開盤）
+    static func taifexSession(now: Date) -> Session {
+        let (wd, m) = taipeiClock(now)
+        let weekday = (2...6).contains(wd)
+        if weekday && m >= 8 * 60 + 45 && m < 13 * 60 + 45 { return .regular }
+        if weekday && m >= 15 * 60 { return .night }
+        if (3...7).contains(wd) && m < 5 * 60 { return .night }
+        return .closed
+    }
+
     private static let misTimeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd HH:mm:ss"
@@ -238,7 +312,27 @@ enum QuoteService {
             }
             // 有 .XX 後綴的是其他國家的掛牌（.TO、.DE、.T…），搜尋結果先略過；直接輸入代號仍可加入
             guard !sym.contains(".") else { return nil }
-            return SearchResult(market: .us, symbol: sym, name: name, exchange: nil, detail: detail)
+            let market: Market = q.quoteType == "FUTURE" ? .futures : .us
+            return SearchResult(market: market, symbol: sym, name: name, exchange: nil, detail: detail)
+        }
+    }
+
+    /// 期交所商品與中文關鍵字（台指期、黃金…），不需連網
+    static func searchLocal(_ query: String) -> [SearchResult] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return [] }
+        var out: [WatchItem] = []
+        if let code = TaifexProduct.code(from: q), let name = TaifexProduct.names[code] {
+            out.append(WatchItem(market: .futures, symbol: code, name: name))
+        }
+        for (keywords, item) in WatchItem.aliases
+        where keywords.contains(where: { $0.contains(q) || ($0.count >= 2 && q.contains($0)) }) {
+            out.append(item)
+        }
+        var seen = Set<String>()
+        return out.filter { seen.insert($0.id).inserted }.map {
+            SearchResult(market: $0.market, symbol: $0.symbol, name: $0.name, exchange: nil,
+                         detail: $0.isTaifex ? "台灣期貨 · 近月" : "\($0.symbol) · 期貨")
         }
     }
 
@@ -257,6 +351,10 @@ enum QuoteService {
     static func resolve(_ input: String) async throws -> WatchItem {
         let raw = input.trimmingCharacters(in: .whitespacesAndNewlines)
         let upper = raw.uppercased()
+        if let code = TaifexProduct.code(from: upper), let name = TaifexProduct.names[code] {
+            guard try await twFutures([code])[code] != nil else { throw QuoteError.notFound(raw) }
+            return WatchItem(market: .futures, symbol: code, name: name)
+        }
         var twCode: String?
         var twExchange: String?
         if ["T00", "O00"].contains(upper) {
@@ -272,7 +370,7 @@ enum QuoteService {
             return WatchItem(market: .tw, symbol: code, name: q.name ?? code, exchange: q.exchange)
         }
         let q = try await yahooChart(upper)
-        return WatchItem(market: .us, symbol: upper, name: q.name ?? upper)
+        return WatchItem(market: upper.hasSuffix("=F") ? .futures : .us, symbol: upper, name: q.name ?? upper)
     }
 }
 
@@ -349,6 +447,27 @@ struct MISResponse: Decodable {
         let d: String?, t: String?
     }
     let msgArray: [Item]?
+}
+
+/// Yahoo 奇摩股市 FinanceChartService.ApacLibraCharts
+struct YahooTWChart: Decodable {
+    struct Meta: Decodable {
+        let name: String?
+        let regularMarketPrice: Double?
+        let regularMarketTime: Double?
+        let previousClose: Double?
+        let chartPreviousClose: Double?
+        let limitUpPrice: Double?
+        let limitDownPrice: Double?
+        let currentTradingPeriod: YahooChart.Periods?
+    }
+    struct Chart: Decodable {
+        let meta: Meta?
+        let timestamp: [Double]?
+        let indicators: YahooChart.Indicators?
+    }
+    let symbol: String
+    let chart: Chart?
 }
 
 struct MISNames: Decodable {

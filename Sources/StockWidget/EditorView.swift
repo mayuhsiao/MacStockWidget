@@ -27,7 +27,7 @@ private struct WatchlistEditor: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("輸入代號或名稱，例：2330、台積電、AAPL、nvidia", text: $query)
+                TextField("輸入代號或名稱，例：2330、台積電、AAPL、台指期、黃金", text: $query)
                     .textFieldStyle(.plain)
                     .focused($focused)
                     .onSubmit { Task { await addTyped() } }
@@ -76,7 +76,7 @@ private struct WatchlistEditor: View {
             .listStyle(.inset(alternatesRowBackgrounds: true))
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
-            Text("拖曳可調整順序。台股報價來自證交所，美股（含盤前/盤後）來自 Yahoo Finance。")
+            Text("拖曳可調整順序。台股來自證交所、台指期來自 Yahoo 奇摩股市，美股（含盤前/盤後）與貴金屬來自 Yahoo Finance。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -95,10 +95,10 @@ private struct WatchlistEditor: View {
             ForEach(results.prefix(8)) { r in
                 let added = store.contains(market: r.market, symbol: r.symbol)
                 HStack(spacing: 8) {
-                    Text(r.market.label)
+                    Text(r.market.shortLabel)
                         .font(.system(size: 10, weight: .semibold))
                         .padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(Capsule().fill((r.market == .tw ? Color.red : Color.blue).opacity(0.15)))
+                        .background(Capsule().fill(r.market.tint.opacity(0.15)))
                     Text(r.symbol).font(.body.monospaced()).frame(minWidth: 64, alignment: .leading)
                     Text(r.name).lineLimit(1)
                     Spacer()
@@ -154,7 +154,8 @@ private struct WatchlistEditor: View {
 
         let hasCJK = q.unicodeScalars.contains { $0.value >= 0x3400 && $0.value <= 0x9FFF }
         let digitsLed = q.first?.isNumber == true
-        var found: [SearchResult] = []
+        // 台指期、黃金等常用商品放最前面
+        var found = QuoteService.searchLocal(q)
         if hasCJK || digitsLed {
             found += (try? await QuoteService.searchTW(q)) ?? []
         }
@@ -185,6 +186,16 @@ private struct WatchlistEditor: View {
             message = nil
         } catch {
             message = error.localizedDescription
+        }
+    }
+}
+
+private extension Market {
+    var tint: Color {
+        switch self {
+        case .tw: return .red
+        case .us: return .blue
+        case .futures: return .orange
         }
     }
 }

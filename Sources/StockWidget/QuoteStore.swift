@@ -41,6 +41,7 @@ final class QuoteStore: ObservableObject {
     private var lastTWFetch = Date.distantPast
     private var lastUSFetch = Date.distantPast
     private var lastSparkFetch = Date.distantPast
+    private var lastFuturesFetch = Date.distantPast
     /// 目前用 Yahoo 備援報價的台股（證交所恢復後要換回來）
     private var twFallback: Set<String> = []
     /// 依來源記錄的錯誤（"台股" 或個股代號），成功後清除
@@ -49,7 +50,7 @@ final class QuoteStore: ObservableObject {
     init() {
         if let data = defaults.data(forKey: Keys.items),
            let saved = try? JSONDecoder().decode([WatchItem].self, from: data) {
-            items = saved
+            items = saved.map(\.migrated)
         } else {
             items = WatchItem.defaults
         }
@@ -93,10 +94,11 @@ final class QuoteStore: ObservableObject {
     }
 
     func move(in market: Market, from source: IndexSet, to destination: Int) {
-        var tw = items(in: .tw), us = items(in: .us)
-        if market == .tw { tw.move(fromOffsets: source, toOffset: destination) }
-        else { us.move(fromOffsets: source, toOffset: destination) }
-        items = tw + us
+        items = Market.allCases.flatMap { m -> [WatchItem] in
+            var list = items(in: m)
+            if m == market { list.move(fromOffsets: source, toOffset: destination) }
+            return list
+        }
     }
 
     // MARK: - 開機自動啟動
@@ -118,18 +120,20 @@ final class QuoteStore: ObservableObject {
     private enum FetchResult {
         case tw([String: Quote])
         case yahoo(id: String, Quote)
+        case twFutures([String: Quote])
         case failure(String, Error)
     }
 
-    var usSession: Session {
-        let sessions = items(in: .us).compactMap { quotes[$0.id]?.session }
-        for s in [Session.regular, .pre, .post] where sessions.contains(s) { return s }
-        return .closed
-    }
-
-    var twSession: Session {
-        items(in: .tw).compactMap { quotes[$0.id]?.session }.first
-            ?? QuoteService.twSession(now: Date(), dataDate: nil)
+    func session(of market: Market) -> Session {
+        switch market {
+        case .tw:
+            return items(in: .tw).compactMap { quotes[$0.id]?.session }.first
+                ?? QuoteService.twSession(now: Date(), dataDate: nil)
+        case .us, .futures:
+            let sessions = items(in: market).compactMap { quotes[$0.id]?.session }
+            for s in [Session.regular, .pre, .post, .night] where sessions.contains(s) { return s }
+            return .closed
+        }
     }
 
     /// 美東 04:00–20:00 的平日（盤前到盤後）
@@ -160,39 +164,53 @@ final class QuoteStore: ObservableObject {
         let usActive = usExtendedHoursNow(now) || us.contains { (quotes[$0.id]?.session ?? .closed) != .closed }
         let usDue = !us.isEmpty && (force || usActive || now.timeIntervalSince(lastUSFetch) > idle
             || us.contains { quotes[$0.id] == nil })
+        let futures = items(in: .futures)
+        let futuresActive = (futures.contains(where: \.isTaifex) && QuoteService.taifexSession(now: now) != .closed)
+            || futures.contains { (quotes[$0.id]?.session ?? .closed) != .closed }
+        let futuresDue = !futures.isEmpty && (force || futuresActive || now.timeIntervalSince(lastFuturesFetch) > idle
+            || futures.contains { quotes[$0.id] == nil })
 
-        guard twDue || sparkDue || usDue else { return }
+        guard twDue || sparkDue || usDue || futuresDue else { return }
         let missing = Set(tw.filter { quotes[$0.id] == nil }.map(\.id))
 
+        let twFutures = futures.filter(\.isTaifex)
+
         var results: [FetchResult] = []
-        await withTaskGroup(of: FetchResult.self) { group in
+        await withTaskGroup(of: [FetchResult].self) { group in
             if twDue {
                 group.addTask {
-                    do { return .tw(try await QuoteService.twse(tw)) } catch { return .failure("台股", error) }
+                    do { return [.tw(try await QuoteService.twse(tw))] } catch { return [.failure("台股", error)] }
                 }
             }
             if sparkDue || twDue {
                 // 台股走勢圖用 Yahoo；證交所失敗時也拿它當備援報價
                 for item in tw where sparkDue || missing.contains(item.id) {
                     group.addTask {
-                        do { return .yahoo(id: item.id, try await QuoteService.yahooChart(item.yahooSymbol)) }
-                        catch { return .failure(item.symbol, error) }
+                        do { return [.yahoo(id: item.id, try await QuoteService.yahooChart(item.yahooSymbol))] }
+                        catch { return [.failure(item.symbol, error)] }
                     }
                 }
             }
-            if usDue {
-                for item in us {
-                    group.addTask {
-                        do { return .yahoo(id: item.id, try await QuoteService.yahooChart(item.symbol)) }
-                        catch { return .failure(item.symbol, error) }
-                    }
+            let yahooItems = (usDue ? us : []) + (futuresDue ? futures.filter { !$0.isTaifex } : [])
+            for item in yahooItems {
+                group.addTask {
+                    do { return [.yahoo(id: item.id, try await QuoteService.yahooChart(item.symbol))] }
+                    catch { return [.failure(item.symbol, error)] }
                 }
             }
-            for await r in group { results.append(r) }
+            if futuresDue && !twFutures.isEmpty {
+                // 台指期等一次請求全部抓回來
+                group.addTask {
+                    do { return [.twFutures(try await QuoteService.twFutures(twFutures.map(\.symbol), now: now))] }
+                    catch { return [.failure("台指期", error)] }
+                }
+            }
+            for await r in group { results += r }
         }
 
         if sparkDue { lastSparkFetch = now }
         if usDue { lastUSFetch = now }
+        if futuresDue { lastFuturesFetch = now }
 
         var twFromMIS: Set<String> = []
 
@@ -214,10 +232,15 @@ final class QuoteStore: ObservableObject {
             switch r {
             case .tw:
                 break
+            case .twFutures(let dict):
+                errors["台指期"] = nil
+                for item in twFutures {
+                    if let q = dict[item.symbol] { quotes[item.id] = q }
+                }
             case .yahoo(let id, let yq):
                 guard let item = items.first(where: { $0.id == id }) else { continue }
                 errors[item.symbol] = nil
-                if item.market == .us {
+                if item.market != .tw {
                     quotes[id] = yq
                 } else if var q = quotes[id], twFromMIS.contains(id) || (!twDue && !twFallback.contains(id)) {
                     // 價格以證交所為準，Yahoo 只補走勢圖
@@ -242,7 +265,7 @@ final class QuoteStore: ObservableObject {
         }
 
         // 移除已經不在清單內的錯誤
-        let valid = Set(items.map(\.symbol)).union(["台股"])
+        let valid = Set(items.map(\.symbol)).union(["台股", "台指期"])
         errors = errors.filter { valid.contains($0.key) }
         lastError = errors.isEmpty ? nil : errors.values.sorted().prefix(3).joined(separator: "\n")
         if results.contains(where: { if case .failure = $0 { return false } else { return true } }) {
